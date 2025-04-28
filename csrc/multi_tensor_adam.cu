@@ -1002,3 +1002,149 @@ void multi_tensor_adam_noupdate_mv_capturable_master_cuda(
 
 }
 
+template <typename T, typename FULL_T, typename index_t>
+struct AdamWRollbackFunctor {
+  __device__ __forceinline__ void operator()(
+      index_t                chunk_size,
+      volatile int*          noop_gmem,
+      TensorListMetadata<4>& tl,
+      const float            beta1,
+      const float            beta2,
+      const float            beta1_correction,   // pre-computed or 1.0
+      const float            beta2_correction,   // pre-computed or 1.0
+      const float            epsilon,
+      const float            lr,
+      adamMode_t             mode,
+      const float            decay)
+  {
+    /* rollback supports AdamW (decoupled) only */
+    assert(mode == ADAM_MODE_1 &&
+           "AdamWRollbackFunctor supports ADAM_MODE_1 (AdamW) only");
+
+    if (*noop_gmem == 1) return;
+
+    /* ---- locate tensors ------------------------------------------------ */
+    index_t tensor_loc = tl.block_to_tensor[blockIdx.x];
+    index_t chunk_idx  = tl.block_to_chunk[blockIdx.x];
+    index_t n          = tl.sizes[tensor_loc];
+
+    T*      g = (T*)     tl.addresses[0][tensor_loc] + chunk_idx * chunk_size;
+    T*      p = (T*)     tl.addresses[1][tensor_loc] + chunk_idx * chunk_size;
+    FULL_T* m = (FULL_T*)tl.addresses[2][tensor_loc] + chunk_idx * chunk_size;
+    FULL_T* v = (FULL_T*)tl.addresses[3][tensor_loc] + chunk_idx * chunk_size;
+
+    n -= chunk_idx * chunk_size;
+
+    /* ---- main loop ----------------------------------------------------- */
+    for (index_t i_start = 0;
+         i_start < n && i_start < chunk_size;
+         i_start += blockDim.x * ILP)
+    {
+      MATH_T r_g[ILP], r_p[ILP], r_m[ILP], r_v[ILP];
+
+#pragma unroll
+      for (int ii = 0; ii < ILP; ++ii) {
+        index_t i = i_start + threadIdx.x + ii * blockDim.x;
+        if (i < n && i < chunk_size) {
+          r_g[ii] = g[i];
+          r_p[ii] = p[i];
+          r_m[ii] = m[i];
+          r_v[ii] = v[i];
+        } else {
+          r_g[ii] = r_p[ii] = r_m[ii] = r_v[ii] = MATH_T(0);
+        }
+      }
+
+#pragma unroll
+      for (int ii = 0; ii < ILP; ++ii) {
+        /* 1. Rebuild moments exactly as the *forward* AdamW step did */
+        r_m[ii] = beta1 * r_m[ii] + (1.f - beta1) * r_g[ii];
+        r_v[ii] = beta2 * r_v[ii] + (1.f - beta2) * r_g[ii] * r_g[ii];
+
+        MATH_T m_hat = r_m[ii] / beta1_correction;
+        MATH_T v_hat = r_v[ii] / beta2_correction;
+
+        MATH_T denom  = sqrtf(v_hat) + epsilon;
+        MATH_T update = m_hat / denom;            // weight-decay excluded
+
+        /* 2. Undo Adam update */
+        r_p[ii] += lr * update;
+
+        /* 3. Undo weight-decay scaling (p_old = p_new / (1 - lr·decay)) */
+        r_p[ii] /= (1.f - lr * decay);
+      }
+
+#pragma unroll
+      for (int ii = 0; ii < ILP; ++ii) {
+        index_t i = i_start + threadIdx.x + ii * blockDim.x;
+        if (i < n && i < chunk_size)
+          p[i] = static_cast<T>(r_p[ii]);   // ONLY p is restored
+      }
+    }
+  }
+};
+
+
+void multi_tensor_adamw_rollback_cuda(
+  int chunk_size,
+  at::Tensor noop_flag,
+  std::vector<std::vector<at::Tensor>> tensor_lists, // g, p, m, v
+  const float lr,
+  const float beta1,
+  const float beta2,
+  const float epsilon,
+  const int   step,
+  const int   mode,            // must be ADAM_MODE_1
+  const int   bias_correction, // 0 or 1
+  const float weight_decay)
+{
+using namespace at;
+
+/* compute bias corrections only if requested */
+float beta1_corr = 1.f, beta2_corr = 1.f;
+if (bias_correction == 1) {
+  beta1_corr = 1.f - std::pow(beta1, step);
+  beta2_corr = 1.f - std::pow(beta2, step);
+}
+
+/* choose 32- vs 64-bit indexing ----------------------------------- */
+bool use_64bit = false;
+size_t max_sz = 0;
+for (auto &grp : tensor_lists)
+  for (auto &t : grp)
+    if ((max_sz = std::max(max_sz, (size_t)t.numel())) >= INT_MAX) {
+      use_64bit = true; break;
+    }
+
+if (use_64bit) {
+  DISPATCH_DOUBLE_FLOAT_HALF_AND_BFLOAT(
+    tensor_lists[0][0].scalar_type(), 0, "adamw_rollback",
+    multi_tensor_apply<4>(
+        (int64_t)BLOCK_SIZE,
+        (int64_t)chunk_size,
+        noop_flag,
+        tensor_lists,
+        AdamWRollbackFunctor<scalar_t_0, float, int64_t>(),
+        beta1, beta2,
+        beta1_corr, beta2_corr,
+        epsilon, lr,
+        static_cast<adamMode_t>(mode),
+        weight_decay));
+} else {
+  DISPATCH_DOUBLE_FLOAT_HALF_AND_BFLOAT(
+    tensor_lists[0][0].scalar_type(), 0, "adamw_rollback",
+    multi_tensor_apply<4>(
+        BLOCK_SIZE,
+        chunk_size,
+        noop_flag,
+        tensor_lists,
+        AdamWRollbackFunctor<scalar_t_0, float, int32_t>(),
+        beta1, beta2,
+        beta1_corr, beta2_corr,
+        epsilon, lr,
+        static_cast<adamMode_t>(mode),
+        weight_decay));
+}
+
+AT_CUDA_CHECK(cudaGetLastError());
+}

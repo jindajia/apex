@@ -167,6 +167,19 @@ void multi_tensor_adam_noupdate_mv_capturable_master_cuda(
   at::Tensor inv_scale);
 
 
+void multi_tensor_adamw_rollback_cuda(
+  int chunk_size,
+  at::Tensor noop_flag,
+  std::vector<std::vector<at::Tensor>> tensor_lists, // g, p, m, v
+  const float lr,
+  const float beta1,
+  const float beta2,
+  const float epsilon,
+  const int   step,
+  const int   mode,            // must be ADAM_MODE_1
+  const int   bias_correction, // 0 or 1
+  const float weight_decay);
+
 void multi_tensor_novograd_cuda(
   int chunk_size,
   at::Tensor noop_flag,
@@ -259,6 +272,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::call_guard<py::gil_scoped_release>());
   m.def("multi_tensor_adam_noupdate_mv", &multi_tensor_adam_noupdate_mv_cuda,
         "Compute and apply gradient update to parameters for Adam optimizer", py::call_guard<py::gil_scoped_release>());
+  m.def("multi_tensor_adamw_rollback", &multi_tensor_adamw_rollback_cuda,
+        "Roll back updated parameter to last step, (should be use together with no_update_mv version adamW update)", py::call_guard<py::gil_scoped_release>());
   m.def("multi_tensor_adam_noupdate_mv_capturable", &multi_tensor_adam_noupdate_mv_capturable_cuda,
         "Compute and apply gradient update to parameters for Adam optimizer with CUDA graph support and LR scheduling",
         py::call_guard<py::gil_scoped_release>());

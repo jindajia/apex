@@ -116,6 +116,7 @@ class FusedAdam(torch.optim.Optimizer):
             self.multi_tensor_adam_noupdate_mv = amp_C.multi_tensor_adam_noupdate_mv
             self.multi_tensor_adam_noupdate_mv_capturable = amp_C.multi_tensor_adam_noupdate_mv_capturable
             self.multi_tensor_adam_noupdate_mv_capturable_master = amp_C.multi_tensor_adam_noupdate_mv_capturable_master
+            self.multi_tensor_adamw_rollback = amp_C.multi_tensor_adamw_rollback
         else:
             raise RuntimeError('apex.optimizers.FusedAdam requires cuda extensions')
 
@@ -486,3 +487,121 @@ class FusedAdam(torch.optim.Optimizer):
                             group['weight_decay'])
 
         return loss
+
+    def rollback_parameter(
+        self, closure=None, grads=None, output_params=None,
+        scale=None, grad_norms=None, grad_scaler=None
+    ):
+        """
+        Undo (roll back) the *previous* AdamW update, restoring each parameter
+        tensor p to the value it had before the last call to ``step``.
+
+        Only ``p`` is modified; internal moment buffers (m, v) are left
+        untouched, exactly matching the CUDA kernel semantics.
+
+        Note
+        ----
+        • Works only when ``adam_w_mode=True``  
+        • The current implementation does **not** support the
+          ``master_weights`` pathway.  Raise if that was requested.
+        """
+        # Guard against legacy args
+        if any(p is not None for p in
+               [grads, output_params, scale, grad_norms]):
+            raise RuntimeError("rollback_parameter() takes no extra arguments.")
+
+        if closure is not None:
+            _ = closure()                      # evaluate but ignore loss
+
+        if self.adam_w_mode == 0:
+            raise RuntimeError("Rollback only implemented for AdamW mode.")
+
+        if self.master_weights:
+            raise RuntimeError(
+                "rollback_parameter() not yet implemented for master_weights=True."
+            )
+
+        for group in self.param_groups:
+            if len(group['params']) == 0:
+                continue
+
+            device           = group['params'][0].device
+            bias_correction  = 1 if group['bias_correction'] else 0
+            beta1, beta2     = group['betas']
+            lr               = group['lr']
+            weight_decay     = group['weight_decay']
+            eps              = group['eps']
+            step_tensor_or_int = group['step'] + 1 if 'step' in group else 1          # *same* step as forward
+
+            # ------------------------------------------------------------
+            # Bucket parameters by dtype for fused multi-tensor apply
+            # ------------------------------------------------------------
+            g_16, p_16, m_16, v_16 = [], [], [], []
+            g_bf, p_bf, m_bf, v_bf = [], [], [], []
+            g_32, p_32, m_32, v_32 = [], [], [], []
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                if p.grad.data.is_sparse:
+                    raise RuntimeError("FusedAdam rollback: sparse grads not supported.")
+
+                st = self.state[p]      # already allocated by forward step
+                if p.dtype == torch.float16:
+                    g_16.append(p.grad.data)
+                    p_16.append(p.data)
+                    m_16.append(st['exp_avg'])
+                    v_16.append(st['exp_avg_sq'])
+                elif p.dtype == torch.bfloat16:
+                    g_bf.append(p.grad)
+                    p_bf.append(p)
+                    m_bf.append(st['exp_avg'])
+                    v_bf.append(st['exp_avg_sq'])
+                elif p.dtype == torch.float32:
+                    g_32.append(p.grad.data)
+                    p_32.append(p.data)
+                    m_32.append(st['exp_avg'])
+                    v_32.append(st['exp_avg_sq'])
+                else:
+                    raise RuntimeError("FusedAdam rollback: unsupported dtype.")
+
+            # ------------------------------------------------------------
+            # Launch fused rollback kernels
+            # ------------------------------------------------------------
+            dummy = self._dummy_overflow_buf  # unused but required signature
+
+            if len(g_16):
+                multi_tensor_applier(
+                    self.multi_tensor_adamw_rollback,
+                    dummy,
+                    [g_16, p_16, m_16, v_16],
+                    lr, beta1, beta2, eps,
+                    step_tensor_or_int,
+                    self.adam_w_mode,          # must be 1
+                    bias_correction,
+                    weight_decay
+                )
+
+            if len(g_bf):
+                multi_tensor_applier(
+                    self.multi_tensor_adamw_rollback,
+                    dummy,
+                    [g_bf, p_bf, m_bf, v_bf],
+                    lr, beta1, beta2, eps,
+                    step_tensor_or_int,
+                    self.adam_w_mode,
+                    bias_correction,
+                    weight_decay
+                )
+
+            if len(g_32):
+                multi_tensor_applier(
+                    self.multi_tensor_adamw_rollback,
+                    dummy,
+                    [g_32, p_32, m_32, v_32],
+                    lr, beta1, beta2, eps,
+                    step_tensor_or_int,
+                    self.adam_w_mode,
+                    bias_correction,
+                    weight_decay
+                )
